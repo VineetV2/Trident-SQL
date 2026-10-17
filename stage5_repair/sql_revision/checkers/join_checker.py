@@ -1,0 +1,58 @@
+from .base import BaseChecker
+from common.dataset import DataItem
+from common.llm import LLM
+from common.logger import logger
+from common.prompt import PromptFactory
+from typing import Dict, Optional, Tuple
+import re
+
+
+class JoinChecker(BaseChecker):
+    
+    def check_and_revise(self, sql: str, data_item: DataItem, llm: LLM, sampling_budget: int = 1) -> Tuple[str, Dict[str, int]]:
+        join_suggestion = self._check_join(sql)
+        if join_suggestion:
+            logger.info(f"[JoinChecker] Found join errors in SQL: {sql}")
+            
+            # Define prompt format function for JoinChecker
+            def prompt_format_func(schema_profile: str) -> str:
+                return PromptFactory.format_common_checker_prompt(
+                    schema_profile, 
+                    data_item.question, 
+                    data_item.evidence, 
+                    sql, 
+                    join_suggestion
+                )
+            
+            final_prompt, level = self._check_and_revise_with_progressive_stripping(data_item, llm, prompt_format_func)
+            
+            if final_prompt is None:
+                logger.error(f"CRITICAL: Even minimal JoinChecker prompt for item {data_item.question_id} exceeds token limit. Returning original SQL.")
+                return sql, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            
+            extractor = self._get_extractor()
+            results, total_token_usage = extractor.extract_with_retry(
+                llm=llm,
+                messages=[{"role": "user", "content": final_prompt}],
+                rule_parser=self._parse_llm_response,
+                fix_end_token=llm.llm_config.fix_end_token,
+                end_token="</result>",
+                n=1
+            )
+            
+            if results:
+                return results[0], total_token_usage
+            return sql, total_token_usage
+        else:
+            return sql, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _check_join(self, sql: str) -> Optional[str]:
+        suggestion = None
+        identifier = r'(?:`[^`]+`|\[[^\]]+\]|"[^"]+"|[\w\.]+)'
+        join_pattern = re.compile(
+            rf"JOIN\s+{identifier}(\s+AS\s+{identifier}){{0,1}}\s+ON(\s+{identifier}\.{identifier}\s*(=\s*{identifier}\.{identifier}(?:\s+OR\s+{identifier}\.{identifier}\s*=\s*{identifier}\.{identifier})+|IN\s+\(.*?\)))",
+            re.IGNORECASE | re.DOTALL
+        )
+        if join_pattern.findall(sql):
+            suggestion = "The SQL uses the JOIN function incorrectly, due to using `JOIN table AS T ON Ta.column1 = Tb.column2 OR Ta.column1 = Tb.column3` or `JOIN table AS T ON Ta.column1 IN`, please only keep the highest priority group of `Ta.column = Tb.column` in `OR`."
+        return suggestion

@@ -1,0 +1,568 @@
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, Union
+import json
+from functools import lru_cache
+from .constants import SPECIAL_CASES_FOR_BIRD_TRAIN_DATABASES
+from .defaults import DEFAULT_MAX_VALUE_EXAMPLE_LENGTH
+from .execution import execute_sql
+from common.logger import logger
+import chardet
+import pandas as pd
+
+
+def load_table_names(db_path: Path) -> List[str]:
+    sql = "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence';"
+    result = execute_sql(db_path, sql)
+    if result.result_type != "success":
+        raise Exception(f"Failed to load table names from {db_path}: {result.error_message}")
+    return [row[0].strip() for row in result.result_rows]
+
+
+def load_column_names_and_types(db_path: Path, table_name: str) -> List[Tuple[str, str]]:
+    sql = f"PRAGMA table_info(`{table_name}`);"
+    result = execute_sql(db_path, sql)
+    if result.result_type != "success":
+        raise Exception(f"Failed to load column names and types from {db_path}: {result.error_message}")
+    return [(row[1].strip(), row[2].strip()) for row in result.result_rows]
+
+
+def load_primary_keys(db_path: Path, table_name: str) -> List[str]:
+    sql = f"PRAGMA table_info(`{table_name}`);"
+    result = execute_sql(db_path, sql)
+    if result.result_type != "success":
+        raise Exception(f"Failed to load primary keys from {db_path}: {result.error_message}")
+    return [row[1].strip() for row in result.result_rows if row[5] != 0]
+
+
+def load_foreign_keys(db_path: Path, table_name: str) -> List[Tuple[str, str, str, str]]:
+    sql = f"PRAGMA foreign_key_list(`{table_name}`);"
+    result = execute_sql(db_path, sql)
+    if result.result_type != "success" and result.result_type != "empty_result":
+        raise Exception(f"Failed to load foreign keys from {db_path}: {result.error_message}")
+    foreign_keys_list = result.result_rows
+    deduplicated_foreign_keys = set([(foreign_key[3], foreign_key[2], foreign_key[4]) for foreign_key in foreign_keys_list])
+    fixed_foreign_keys = []
+    for foreign_key in deduplicated_foreign_keys:
+        source_table_name = table_name.strip()
+        source_column_name = foreign_key[0].strip()
+        target_table_name = foreign_key[1].strip()
+        target_column_name = None
+        if foreign_key[2] is not None:
+            target_column_name = foreign_key[2].strip()
+        else:
+            # Try to fix target column is None by searching primary keys of target table
+            target_table_primary_keys = load_primary_keys(db_path, target_table_name)
+            if len(target_table_primary_keys) > 1:
+                for target_table_primary_key in target_table_primary_keys:
+                    if target_table_primary_key.lower() == source_column_name.lower():
+                        target_column_name = target_table_primary_key
+                        break
+            elif len(target_table_primary_keys) == 1:
+                target_column_name = target_table_primary_keys[0]
+            else:
+                raise ValueError(f"Target column is None and cannot be fixed by primary keys of target table: {target_table_name}, source table: {source_table_name}, source column: {source_column_name}")
+        foreign_key_tuple = (source_table_name, source_column_name, target_table_name, target_column_name)
+
+        # Special cases for bird train databases
+        current_db_id = db_path.stem
+        if (current_db_id, *foreign_key_tuple) in SPECIAL_CASES_FOR_BIRD_TRAIN_DATABASES:
+            foreign_key_tuple = SPECIAL_CASES_FOR_BIRD_TRAIN_DATABASES[(current_db_id, *foreign_key_tuple)]
+
+        assert None not in foreign_key_tuple, f"Foreign key tuple contains None: {foreign_key_tuple}"
+        fixed_foreign_keys.append(foreign_key_tuple)
+    return fixed_foreign_keys
+
+
+def load_value_examples(
+    db_path: str,
+    table_name: str,
+    column_name: str,
+    max_num_examples: int = 3,
+    max_example_length: int = DEFAULT_MAX_VALUE_EXAMPLE_LENGTH,
+) -> List[str]:
+    # Query the values not NULL and not empty
+    result = execute_sql(db_path, f"SELECT DISTINCT `{column_name}` FROM `{table_name}` WHERE `{column_name}` IS NOT NULL AND `{column_name}` != '' AND length(cast(`{column_name}` as text)) <= {max_example_length} LIMIT {max_num_examples};")
+    if result.result_type != "success" and result.result_type != "empty_result":
+        raise ValueError(f"Failed to load value_examples from {db_path}: {result.error_message}")
+    value_examples = [str(row[0]) for row in result.result_rows]
+    return value_examples
+
+
+def _normalize_description_string(description: str) -> str:
+    """
+    Normalize the description string.
+    """
+    description = description.replace("\r", " ").replace("\n", " ").replace("commonsense evidence:", "").strip()
+    while "  " in description:
+        description = description.replace("  ", " ")
+    return description.strip()
+
+
+def load_database_description(db_id: str, database_dir: Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Load database description from database.
+    
+    Args:
+        db_id: Database ID.
+        database_dir: Directory of current database.
+    Returns:
+        A dictionary with lowercased table names as keys and table descriptions as values.
+        The table description is a dictionary with lowercased original column names as keys and column descriptions as values.
+    """
+    db_description_dir = database_dir / "database_description"
+    if not db_description_dir.exists():
+        logger.warning(f"Database description for database {db_id} does not exist, skipping...")
+        return {}
+    database_description = {}
+    for csv_file in db_description_dir.glob("*.csv"):
+        table_name_lower = csv_file.stem.lower().strip()
+        encoding_type = chardet.detect(csv_file.read_bytes())["encoding"]
+        table_description = {}
+        table_description_df = pd.read_csv(csv_file, encoding=encoding_type, index_col=False)
+        for _, row in table_description_df.iterrows():
+            if pd.isna(row["original_column_name"]):
+                continue
+            original_column_name_lower = row["original_column_name"].strip().lower()
+            expanded_column_name = row["column_name"].strip() if pd.notna(row["column_name"]) else ""
+            column_description = _normalize_description_string(row["column_description"]) if pd.notna(row["column_description"]) else ""
+            data_format = row["data_format"].strip() if pd.notna(row["data_format"]) else ""
+            value_description = _normalize_description_string(row["value_description"]) if pd.notna(row["value_description"]) else ""
+            if value_description.lower().startswith("not useful"):
+                value_description = value_description[len("not useful"):].strip()
+            table_description[original_column_name_lower] = {
+                "original_column_name_lower": original_column_name_lower,
+                "expanded_column_name": expanded_column_name,
+                "column_description": column_description,
+                "data_format": data_format,
+                "value_description": value_description,
+                "is_unuseful": value_description.casefold() in {"unuseful", "unusedful"},
+            }
+        database_description[table_name_lower] = table_description
+    return database_description
+
+
+def load_value_statistics(db_path: str, table_name: str, column_name: str) -> Dict[str, Any]:
+    sql = f"""
+        SELECT COUNT(`{column_name}`) AS total_count, COUNT(DISTINCT `{column_name}`) AS distinct_count, SUM(CASE WHEN `{column_name}` IS NULL THEN 1 ELSE 0 END) AS null_count  
+        FROM (SELECT `{column_name}` FROM `{table_name}` LIMIT 100000) AS limited_dataset;
+    """
+    result = execute_sql(db_path, sql)
+    if result.result_type != "success":
+        raise ValueError(f"Failed to load value_statistics from {db_path}: {result.error_message}")
+    return {
+        "total_count": result.result_rows[0][0],
+        "distinct_count": result.result_rows[0][1],
+        "null_count": result.result_rows[0][2]
+    }
+
+
+@lru_cache(maxsize=1000)
+def load_database_schema_dict(db_path: Union[str, Path]) -> Dict[str, Any]:
+    db_path = Path(db_path) if isinstance(db_path, str) else db_path
+    db_id = db_path.stem
+    database_description = load_database_description(db_id, db_path.parent)
+    database_schema_dict = {}
+    database_schema_dict["db_id"] = db_id
+    database_schema_dict["db_path"] = str(db_path)
+    database_schema_dict["db_type"] = "sqlite"
+    database_schema_dict["tables"] = {}
+    table_names = load_table_names(db_path)
+    for table_name in table_names:
+        table_schema_dict = {}
+        table_schema_dict["table_name"] = table_name
+        table_schema_dict["columns"] = {}
+        
+        # Load primary keys
+        primary_keys = load_primary_keys(db_path, table_name)
+
+        # Load foreign keys
+        foreign_keys = load_foreign_keys(db_path, table_name)
+        
+        # Load columns
+        column_names_and_types = load_column_names_and_types(db_path, table_name)
+        for column_name, column_type in column_names_and_types:
+            column_schema_dict = {}
+            column_schema_dict["column_name"] = column_name
+            column_schema_dict["column_type"] = column_type
+            column_schema_dict["is_unuseful"] = database_description.get(
+                table_name.lower(), {}
+            ).get(column_name.lower(), {}).get("is_unuseful", False)
+            
+            # Set primary keys
+            if column_name.lower() in [pk.lower() for pk in primary_keys]:
+                column_schema_dict["primary_key"] = True
+            else:
+                column_schema_dict["primary_key"] = False
+            
+            # Set foreign keys
+            column_schema_dict["foreign_keys"] = []
+            for source_table_name, source_column_name, target_table_name, target_column_name in foreign_keys:
+                assert source_table_name == table_name, f"Source table name is not the same as the table name: {source_table_name} != {table_name}"
+                if source_column_name.lower() == column_name.lower():
+                    column_schema_dict["foreign_keys"].append((target_table_name, target_column_name))
+
+            # Set column description
+            descriptions = []
+            if database_description.get(table_name.lower(), {}).get(column_name.lower(), {}).get("expanded_column_name", "") != "":
+                descriptions.append(f"Expanded Column Name: {database_description.get(table_name.lower(), {}).get(column_name.lower(), {}).get('expanded_column_name', '')}")
+            if database_description.get(table_name.lower(), {}).get(column_name.lower(), {}).get("column_description", "") != "":
+                descriptions.append(f"Column Description: {database_description.get(table_name.lower(), {}).get(column_name.lower(), {}).get('column_description', '')}")
+            if database_description.get(table_name.lower(), {}).get(column_name.lower(), {}).get("value_description", "") != "":
+                descriptions.append(f"Value Description: {database_description.get(table_name.lower(), {}).get(column_name.lower(), {}).get('value_description', '')}")
+            column_schema_dict["description"] = " | ".join(descriptions) if descriptions else ""
+            
+            # Load expensive column profiles lazily when a stage actually needs them.
+            if column_type.upper() != "BLOB":
+                column_schema_dict["value_examples"] = None
+            else:
+                column_schema_dict["value_examples"] = []
+
+            column_schema_dict["value_statistics"] = None
+            
+            table_schema_dict["columns"][column_name] = column_schema_dict
+        database_schema_dict["tables"][table_name] = table_schema_dict
+        
+    # Special cases for spider databases, some foreign key columns are not in the database
+    # So we need to check if the foreign key columns are in the database
+    for table_name, table_schema_dict in database_schema_dict["tables"].items():
+        for column_name, column_schema_dict in table_schema_dict["columns"].items():
+            for target_table_name, target_column_name in column_schema_dict["foreign_keys"]:
+                if target_table_name not in database_schema_dict["tables"] or target_column_name not in database_schema_dict["tables"][target_table_name]["columns"]:
+                    column_schema_dict["foreign_keys"].remove((target_table_name, target_column_name))
+        
+    return database_schema_dict
+
+
+def _compute_table_schema_signature(table_schema_dict: Dict[str, Any]) -> str:
+    """
+    Compute a signature for a table's schema structure based on column names.
+    This is used to identify tables with identical schema structures for prompt compression.
+    """
+    columns = table_schema_dict.get("columns", {})
+    # Only use sorted column names for the signature.
+    # This is stable and sufficient to identify partitioned/sharded tables.
+    sorted_col_names = sorted([
+        col_name.lower()
+        for col_name, column_schema_dict in columns.items()
+        if not _is_unuseful_column(column_schema_dict)
+    ])
+    
+    signature_parts = sorted_col_names
+    
+    return "||".join(signature_parts)
+
+
+def _is_unuseful_column(column_schema_dict: Dict[str, Any]) -> bool:
+    """Return whether a column is explicitly marked as unuseful in metadata."""
+    if column_schema_dict.get("is_unuseful", False):
+        return True
+
+    # Keep compatibility with schema dictionaries created before the structured
+    # marker was added. Avoid a substring match because ordinary descriptions may
+    # legitimately discuss the word without declaring the column unuseful.
+    for description_part in column_schema_dict.get("description", "").split("|"):
+        label, separator, value = description_part.strip().partition(":")
+        if (
+            separator
+            and label.strip().casefold() == "value description"
+            and value.strip().casefold() in {"unuseful", "unusedful"}
+        ):
+            return True
+    return False
+
+
+def _group_tables_by_schema(database_schema_dict: Dict[str, Any]) -> Dict[str, List[str]]:
+    """
+    Group tables by their schema signature.
+    Returns a dict mapping signature -> list of table keys.
+    """
+    signature_to_tables = {}
+    for table_key, table_schema_dict in database_schema_dict["tables"].items():
+        signature = _compute_table_schema_signature(table_schema_dict)
+        if signature not in signature_to_tables:
+            signature_to_tables[signature] = []
+        signature_to_tables[signature].append(table_key)
+    return signature_to_tables
+
+
+def get_identical_schema_table_groups(database_schema_dict: Dict[str, Any]) -> Dict[str, List[str]]:
+    """
+    Get groups of tables that have identical schema structures.
+    
+    Args:
+        database_schema_dict: The database schema dictionary.
+    
+    Returns:
+        A dict mapping each table_key to the list of all table_keys with identical schema.
+        Only tables that have at least one other table with the same schema are included.
+        
+    Example:
+        If tables A, B, C have identical schemas, returns:
+        {"A": ["A", "B", "C"], "B": ["A", "B", "C"], "C": ["A", "B", "C"]}
+    """
+    signature_to_tables = _group_tables_by_schema(database_schema_dict)
+    
+    # Build reverse mapping: table_key -> all tables with same schema
+    table_to_group = {}
+    for signature, table_keys in signature_to_tables.items():
+        if len(table_keys) > 1:  # Only groups with multiple tables
+            for table_key in table_keys:
+                table_to_group[table_key] = table_keys
+    
+    return table_to_group
+
+
+def _format_single_table_profile(
+    table_schema_dict: Dict[str, Any], 
+    display_table_name: str,
+    include_description: bool = True,
+    include_value_statistics: bool = True,
+    include_value_examples: bool = True
+) -> str:
+    """Format the profile for a single table with optional components."""
+    profile = f"- Table: `{display_table_name}`\n"
+    profile += f"[\n"
+    column_profiles = []
+    columns = list(table_schema_dict["columns"].items())
+    
+    # Sort columns: primary keys first, then others
+    pk_columns = [(col_name, col_schema) for col_name, col_schema in columns if col_schema.get("primary_key", False)]
+    non_pk_columns = [(col_name, col_schema) for col_name, col_schema in columns if not col_schema.get("primary_key", False)]
+    ordered_columns = pk_columns + non_pk_columns
+    
+    for column_name, column_schema_dict in ordered_columns:
+        if _is_unuseful_column(column_schema_dict):
+            continue
+
+        column_profile = f"`{column_name}`: {column_schema_dict['column_type']}"
+        if column_schema_dict.get("primary_key", False):
+            column_profile += f" | Primary Key"
+        
+        if include_description and column_schema_dict.get("description"):
+            column_profile += f" | {column_schema_dict['description']}"
+            
+        if include_value_statistics and column_schema_dict.get("value_statistics"):
+            stats = column_schema_dict["value_statistics"]
+            column_profile += f" | Value Statistics: {stats['null_count']} NULL values, {stats['distinct_count']} distinct values, {stats['total_count']} total values"
+            
+        if include_value_examples and column_schema_dict.get("value_examples"):
+            column_profile += f" | Value Examples: {column_schema_dict['value_examples']}"
+            
+        column_profiles.append(f"({column_profile})")
+    column_reps_str = ",\n".join(column_profiles)
+    profile += f"{column_reps_str}\n"
+    profile += f"]\n"
+    
+    return profile
+
+
+def get_database_schema_profile(
+    database_schema_dict: Dict[str, Any], 
+    compress_identical_schemas: bool = True,
+    include_description: bool = True,
+    include_value_statistics: bool = True,
+    include_value_examples: bool = True
+) -> str:
+    """
+    Generate a human-readable schema profile for the database.
+    
+    Args:
+        database_schema_dict: The database schema dictionary.
+        compress_identical_schemas: If True, tables with identical schema structures are compressed.
+        include_description: Whether to include column descriptions.
+        include_value_statistics: Whether to include value statistics.
+        include_value_examples: Whether to include value examples.
+    """
+    profile = ""
+    db_id = database_schema_dict["db_id"]
+    db_type = database_schema_dict.get("db_type", "sqlite")
+    
+    profile += f"Database ID: `{db_id}`\n"
+    
+    # Show database type
+    if db_type == "sqlite":
+        profile += f"Database Type: {db_type.upper()}\n"
+    
+    profile += f"Schema:\n"
+    
+    # Group tables by schema signature for compression
+    if compress_identical_schemas:
+        signature_to_tables = _group_tables_by_schema(database_schema_dict)
+        processed_tables = set()
+        
+        for signature, table_keys in signature_to_tables.items():
+            if len(table_keys) == 1:
+                # Only one table with this schema, display normally
+                table_key = table_keys[0]
+                table_schema_dict = database_schema_dict["tables"][table_key]
+                display_table_name = table_schema_dict.get("table_name", table_key)
+                profile += _format_single_table_profile(
+                    table_schema_dict, display_table_name,
+                    include_description, include_value_statistics,
+                    include_value_examples
+                )
+                processed_tables.add(table_key)
+            else:
+                # Multiple tables with identical schema - compress them
+                representative_key = table_keys[0]
+                representative_table = database_schema_dict["tables"][representative_key]
+                representative_name = representative_table.get("table_name", representative_key)
+                
+                # Collect other table names
+                other_table_names = []
+                for table_key in table_keys[1:]:
+                    other_table = database_schema_dict["tables"][table_key]
+                    other_name = other_table.get("table_name", table_key)
+                    other_table_names.append(other_name)
+                
+                # Display representative table with full schema
+                profile += _format_single_table_profile(
+                    representative_table, representative_name,
+                    include_description, include_value_statistics,
+                    include_value_examples
+                )
+                
+                # Add note about other tables with identical schema
+                profile += f"  [Note: The following {len(other_table_names)} tables have IDENTICAL schema structure as `{representative_name}` above:\n"
+                profile += "  " + ", ".join([f"`{name}`" for name in other_table_names])
+                profile += "\n  You can query any of these tables using the same column structure.]\n\n"
+                processed_tables.update(table_keys)
+    else:
+        # No compression - display all tables normally
+        for table_key, table_schema_dict in database_schema_dict["tables"].items():
+            display_table_name = table_schema_dict.get("table_name", table_key)
+            profile += _format_single_table_profile(
+                table_schema_dict, display_table_name,
+                include_description, include_value_statistics,
+                include_value_examples
+            )
+
+    # Foreign keys section (mainly for SQLite databases)
+    all_foreign_keys = []
+    for table_name, table_schema_dict in database_schema_dict["tables"].items():
+        for column_name, column_schema_dict in table_schema_dict["columns"].items():
+            if _is_unuseful_column(column_schema_dict):
+                continue
+            for target_table_name, target_column_name in column_schema_dict.get("foreign_keys", []):
+                # Check if both tables and columns exist
+                if (target_table_name in database_schema_dict["tables"] and 
+                    target_column_name in database_schema_dict["tables"][target_table_name]["columns"] and
+                    not _is_unuseful_column(database_schema_dict["tables"][target_table_name]["columns"][target_column_name])):
+                    all_foreign_keys.append(f"`{table_name}`.`{column_name}` = `{target_table_name}`.`{target_column_name}`")
+    if all_foreign_keys:
+        profile += "Foreign Keys:\n"
+        fk_str = "\n".join(all_foreign_keys)
+        profile += f"{fk_str}"
+    
+    return profile
+
+
+def map_lower_table_name_to_original_table_name(table_name: str, database_schema_dict: Dict[str, Any]) -> Optional[str]:
+    # 1. Try exact match with keys in the dictionary first (case-insensitive)
+    for table_key in database_schema_dict["tables"]:
+        if table_key.lower() == table_name.lower():
+            return table_key
+            
+    # 2. Try wildcard match (if table_name contains *)
+    if "*" in table_name:
+        try:
+            import re
+            # Convert glob-style wildcard to regex (e.g., "ga_sessions_*" -> "ga_sessions_.*")
+            pattern = re.escape(table_name.lower()).replace(r"\*", ".*")
+            for table_key in database_schema_dict["tables"]:
+                if re.fullmatch(pattern, table_key.lower()):
+                    return table_key
+        except Exception:
+            pass
+            
+    # 3. Then try matching table_name within table schema
+    for table_key, table_schema_dict in database_schema_dict["tables"].items():
+        if table_schema_dict.get("table_name", "").lower() == table_name.lower():
+            return table_key
+            
+    # 4. Try base name matching (if table_name is 'LICENSES' and schema has 'GITHUB_REPOS.LICENSES')
+    for table_key, table_schema_dict in database_schema_dict["tables"].items():
+        # Check table_key (e.g., "GITHUB_REPOS.LICENSES")
+        if "." in table_key and table_key.lower().split(".")[-1] == table_name.lower():
+            return table_key
+        
+        # Check table_name field
+        t_name = table_schema_dict.get("table_name", "")
+        if t_name and "." in t_name and t_name.lower().split(".")[-1] == table_name.lower():
+            return table_key
+            
+    logger.warning(f"Mapping lower table name to original table name failed: {table_name}")
+    return None
+
+
+def map_lower_column_name_to_original_column_name(table_name: str, column_name: str, database_schema_dict: Dict[str, Any]) -> Optional[str]:
+    # Use the table_name (which might be a key or name) to find the table first
+    if table_name in database_schema_dict["tables"]:
+        table_schema_dict = database_schema_dict["tables"][table_name]
+        # Only match against top-level columns as per user instruction
+        for col_name in table_schema_dict["columns"]:
+            if col_name.lower() == column_name.lower():
+                return col_name
+                
+    # Fallback to searching all tables
+    for table_key, table_dict in database_schema_dict["tables"].items():
+        # Check if table_name matches (including base name comparison)
+        table_matches = False
+        t_name = table_dict.get("table_name", "")
+        
+        if table_key.lower() == table_name.lower() or \
+           t_name.lower() == table_name.lower():
+            table_matches = True
+        elif ("." in table_key and table_key.lower().split(".")[-1] == table_name.lower()) or \
+             (t_name and "." in t_name and t_name.lower().split(".")[-1] == table_name.lower()):
+            table_matches = True
+            
+        if table_matches:
+            for col_name in table_dict["columns"]:
+                if col_name.lower() == column_name.lower():
+                    return col_name
+                    
+    # logger.warning(f"Mapping lower column name to original column name failed: {column_name}")
+    return None
+
+
+def filter_used_database_schema(database_schema_dict: Dict[str, Any], linked_tables_and_columns: Dict[str, List[str]], force_include_pks_and_fks: bool = True):
+    filtered_database_schema_dict = {
+        "db_id": database_schema_dict["db_id"],
+        "db_path": database_schema_dict["db_path"],
+        "db_type": database_schema_dict.get("db_type", "sqlite"),
+        "tables": {}
+    }
+
+    for table_name in linked_tables_and_columns.keys():
+        if table_name not in database_schema_dict["tables"]:
+            logger.warning(f"Table {table_name} not found in database schema, skipping...")
+            continue
+            
+        table_dict = database_schema_dict["tables"][table_name]
+        filtered_table_dict = {
+            "table_name": table_dict["table_name"],
+            "columns": {}
+        }
+        
+        for column_name in linked_tables_and_columns[table_name]:
+            if column_name in table_dict["columns"]:
+                filtered_table_dict["columns"][column_name] = table_dict["columns"][column_name].copy()
+            else:
+                logger.warning(f"Column {column_name} not found in table {table_name}, skipping...")
+        
+        if len(filtered_table_dict["columns"]) > 0:
+            filtered_database_schema_dict["tables"][table_name] = filtered_table_dict
+    
+    if force_include_pks_and_fks:
+        for table_name, table_dict in database_schema_dict["tables"].items():
+            for column_name, column_schema_dict in table_dict["columns"].items():
+                if column_schema_dict["primary_key"] and table_name in filtered_database_schema_dict["tables"]:
+                    filtered_database_schema_dict["tables"][table_name]["columns"][column_name] = column_schema_dict.copy()
+                if column_schema_dict["foreign_keys"]:
+                    for target_table_name, target_column_name in column_schema_dict["foreign_keys"]:
+                        if table_name in filtered_database_schema_dict["tables"] and target_table_name in filtered_database_schema_dict["tables"] and target_column_name in database_schema_dict["tables"][target_table_name]["columns"]:
+                            filtered_database_schema_dict["tables"][table_name]["columns"][column_name] = column_schema_dict.copy()
+                            filtered_database_schema_dict["tables"][target_table_name]["columns"][target_column_name] = database_schema_dict["tables"][target_table_name]["columns"][target_column_name].copy()
+                    
+    return filtered_database_schema_dict

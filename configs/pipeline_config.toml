@@ -1,0 +1,124 @@
+# The pipeline's settings in one file: the model, the temperature of each stage, the model server and the base
+# stages' own settings. The values are those of the reported dev run. The on/off switches of
+# our own parts (the query tree's loop mode) are set in pipeline.py.
+#
+# pipeline.py reads this file when a run starts and writes, into the run folder, the files the stages read:
+#   <run>/port_config.toml                  the base stages (stages 0-5 and 7), through CONFIG_PATH
+#   <run>/model_plan_and_fragment.yaml      Plan-and-Fragment, stage 4 (--settings)
+#   <run>/model_query_tree.yaml             query tree, stage 6 (THESIS_MODEL_SETTINGS)
+# serving/serve_and_run_local.sh reads [model] and [server] from this file directly.
+# This machine's paths (data, indexes, embedding model, server address, run folder) are not here: pipeline.py fills
+# them in from its command line.
+
+[model]                          # gpt-oss-120b, the one model every stage calls
+name = "openai/gpt-oss-120b"
+hf_revision = "b5c939de8f754692c1647ca79fbf85e8c1e70f8a"   # = HF main 2026-09-23
+reasoning_effort = "high"        # sent as the request parameter "reasoning_effort" (unset = medium)
+max_output_tokens = 32768        # the base stages too (as max_tokens)
+top_p = 1.0                      # sent by our stages (4 and 6) only; the base stages send none (server default)
+request_timeout_s = 600          # our stages; the base stages use [base.run] llm_timeout
+
+[temperature]
+base_stages = 0.7                # the base stages: the template's value
+plan_and_fragment = 0.7          # stage 4, our writer
+query_tree = 1.0                 # stage 6 (OpenAI's recommended value; the reported run used it)
+
+[server]                         # vLLM 0.23.0, started by serving/serve_and_run_local.sh
+tensor_parallel_size = 2         # the model split over 2 GPUs
+max_model_len = 131072           # the server's context length (the model's native one)
+
+[smoke]                          # only with --max-samples N, a quick test (not the real setting)
+max_output_tokens = 4096
+base_max_model_len = 16384
+
+# ---------------------------------------------------------------------------------------------------------------
+# Settings of the base stages (0-5 and 7). Taken from a published BIRD dev configuration (the template), with only
+# these changes:
+#   - the model is gpt-oss-120b on our local vLLM server; the Qwen-only sampling options (top_p 0.8, top_k 20,
+#     repetition_penalty 1.05) are dropped;
+#   - reasoning effort high and 32,768 output tokens (from [model]); max_model_len 81,920 (template 65,536), so the
+#     prompt budget stays 81,920 - 32,768 = 49,152, the template's 65,536 - 16,384;
+#   - SQL generation budgets dc 4 / skeleton 0 / icl 4 (template 12 / 12 / 12);
+#   - a local embedding model (Qwen3-Embedding-0.6B) instead of an embedding server; llm_timeout 600 s (template 300).
+# Temperature 0.7 and every other budget and threshold are the template's.
+# pipeline.py fills in: [run] save_root and exp_name (from --run-dir); in the model profile model, max_tokens,
+# temperature and reasoning_effort (from [model] and [temperature]) and base_url (--base-url); [embedding]
+# embedding_model_name_or_path (--embed-model); [dataset] root_path (--data-root); [vector_database] store_root_path
+# (--vector-store); [few_shot_index] save_path and mask_cache_path (--fewshot-index); and "cuda:0" for the three
+# embedding devices. Setting any of these here is an error.
+
+[base.logger]
+print_level = "INFO"
+
+[base.run]
+parallelism = 16
+embedding_batch_size = 256
+llm_timeout = 600
+progress_log_interval = 50
+checkpoint_interval = 20
+default_llm_profile = "gpt_oss_120b"
+
+[base.llm_profiles.gpt_oss_120b]
+api_key = "EMPTY"
+n_call_strategy = "single"
+api_type = "openai"
+max_model_len = 81920            # the base stages' limit for prompt plus answer (not the server's)
+
+[base.embedding]
+api_type = "local"
+use_qwen3_embedding = true
+local_files_only = true
+normalize_embeddings = true
+
+[base.dataset]
+type = "bird"
+split = "dev"
+sql_execution_timeout = 600
+
+[base.vector_database]
+max_value_length = 100
+lower_meta_data = true
+build_backend = "local_index"
+
+[base.few_shot_index]
+num_examples = 7
+question_weight = 0.6
+sql_weight = 0.4
+force_rebuild = false
+llm_profile = "gpt_oss_120b"
+
+[base.few_shot_index.preliminary_sql]
+enabled = true
+dc_sampling_budget = 12
+skeleton_sampling_budget = 12
+llm_profile = "gpt_oss_120b"
+
+[base.value_retrieval]
+max_values_per_column = 5
+backend = "local_index"
+llm_profile = "gpt_oss_120b"
+
+[base.schema_linking]
+direct_linking_sampling_budget = 12
+reversed_linking_sampling_budget = 12
+value_distance_threshold = 0.05
+llm_profile = "gpt_oss_120b"
+
+[base.sql_generation]
+dc_sampling_budget = 4
+skeleton_sampling_budget = 0
+icl_sampling_budget = 4
+llm_profile = "gpt_oss_120b"
+
+[base.sql_revision]
+checker_sampling_budget = 16
+llm_profile = "gpt_oss_120b"
+
+[base.sql_selection]
+filter_top_k_sql = 2
+evaluator_sampling_budget = 16
+shortcut_consistency_score_threshold = 0.6
+llm_profile = "gpt_oss_120b"
+
+[base.llm_extractor]
+max_retry = 5
