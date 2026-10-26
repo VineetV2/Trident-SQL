@@ -28,6 +28,7 @@ Text-to-SQL pipeline for the BIRD benchmark: turns a question in English into an
 | `common/` | code shared by all stages |
 | `assets/` | the pipeline flow chart above |
 | `NOTICE` | licence of the third-party code the base stages are adapted from |
+| `LICENSE` | MIT licence of this repository |
 
 ## Run end to end
 
